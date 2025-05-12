@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <arpa/inet.h>
 #include <ctime>
+#include <openssl/sha.h>
 
 #define BROADCAST_PORT 9000
 #define TCP_PORT 8050
@@ -46,7 +47,14 @@ vector<vector<string>> readFile(const string &filename)
     }
     return data;
 }
-
+void hash_password(const char *password, char *output)
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)password, strlen(password), hash);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++)
+        sprintf(output + (i * 2), "%02x", hash[i]);
+    output[SHA256_DIGEST_LENGTH * 2] = '\0';
+}
 // Escape special characters in CSV
 string escapeCSV(const string &field)
 {
@@ -504,8 +512,15 @@ void User::registerUser(int sock)
     sendPrompt(sock, "Enter a Strong Password:");
     string password = receiveInput(sock);
 
+    // mtx.lock();
+    // writeFile(USER_FILE, {aadhar, name, to_string(age), password});
+    // mtx.unlock();
+    // Hash the password
+    char hash[SHA256_DIGEST_LENGTH * 2 + 1];
+    hash_password(password.c_str(), hash);
+
     mtx.lock();
-    writeFile(USER_FILE, {aadhar, name, to_string(age), password});
+    writeFile(USER_FILE, {aadhar, name, to_string(age), string(hash)});
     mtx.unlock();
     sendPrompt(sock, "✅ Registration Successful!\n");
 } // d
@@ -518,12 +533,18 @@ string User::login(int sock)
     sendPrompt(sock, "Enter Your Password:");
     string password = receiveInput(sock);
 
+    // Hash the entered password
+    char hashedPassword[SHA256_DIGEST_LENGTH * 2 + 1];
+    hash_password(password.c_str(), hashedPassword);
+
+
     auto users = readFile(USER_FILE);
     for (auto &row : users)
     {
         if (row.size() < 4)
             continue;
-        if (row[0] == aadhar && row[3] == password)
+        // if (row[0] == aadhar && row[3] == password)
+        if (row[0] == aadhar && row[3] == hashedPassword)
         {
             sendPrompt(sock, "✅ Login Successful!\n");
             return aadhar;
@@ -630,8 +651,14 @@ void Driver::registerDriver(int sock)
     sendPrompt(sock, "Enter a Strong Password:");
     string password = receiveInput(sock);
 
+    // Hash the password
+char hash[SHA256_DIGEST_LENGTH * 2 + 1];
+hash_password(password.c_str(), hash);
+
+
     mtx.lock();
-    writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), password});
+    // writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), password});
+    writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), string(hash)});
     mtx.unlock();
     sendPrompt(sock, "✅ Registration Successful!\n");
 } // d
@@ -653,6 +680,10 @@ string Driver::loginDriver(int sock)
     sendPrompt(sock, "Enter Your Password:");
     string password = trim(receiveInput(sock));
 
+    // Hash the entered password
+    char hashedPassword[SHA256_DIGEST_LENGTH * 2 + 1];
+    hash_password(password.c_str(), hashedPassword);
+
     auto users = readFile(DRIVER_FILE);
 
     for (auto &row : users)
@@ -663,7 +694,8 @@ string Driver::loginDriver(int sock)
         string storedAadhar = trim(row[0]);
         string storedPassword = trim(row[4]);
 
-        if (storedAadhar == aadhar && storedPassword == password)
+        if (storedAadhar == aadhar && storedPassword == hashedPassword)
+        // if (storedAadhar == aadhar && storedPassword == password)
         {
             sendPrompt(sock, "✅ Login Successful!\n");
             return storedAadhar;
@@ -982,7 +1014,8 @@ vector<vector<string>> ReservationHandler::viewTrips(int sock)
         //     }
         //     upcomingTrips.push_back(trip);
         // }
-        if (trip.size() != 7) continue;
+        if (trip.size() != 7)
+            continue;
 
         string dateTimeStr = trip[6];
 
@@ -1133,6 +1166,8 @@ void ReservationHandler::reserve(int sock)
             auto buses = readFile(BUS_FILE);
             for (const auto &b : buses)
             {
+                cout << "[DEBUG] b[0] = '" << b[0] << "', busNo = '" << busNo << "'" << endl;
+
                 if (b.size() == 4 && b[0] == busNo)
                 {
                     rows = stoi(b[2]);
