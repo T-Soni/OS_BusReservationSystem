@@ -260,14 +260,16 @@ bool isDateTimeAfterNow(const string &dateTimeStr)
 
     return difftime(trip_time, now_time) > 0;
 }
-int getMinutesFromDateTime(const string &dateTimeStr)
+// int getMinutesFromDateTime(const string &dateTimeStr)
+time_t getTimeFromDateTime(const string &dateTimeStr)
 {
     tm trip_tm = {};
     if (strptime(dateTimeStr.c_str(), "%a %b %d %H:%M:%S %Y", &trip_tm) == nullptr)
     {
         return -1; // Error
     }
-    return trip_tm.tm_hour * 60 + trip_tm.tm_min;
+    // return trip_tm.tm_hour * 60 + trip_tm.tm_min;
+    return mktime(&trip_tm); // full datetime in seconds since epoch
 }
 
 // SEAT MATRIX PRINTING
@@ -537,7 +539,6 @@ string User::login(int sock)
     char hashedPassword[SHA256_DIGEST_LENGTH * 2 + 1];
     hash_password(password.c_str(), hashedPassword);
 
-
     auto users = readFile(USER_FILE);
     for (auto &row : users)
     {
@@ -652,9 +653,8 @@ void Driver::registerDriver(int sock)
     string password = receiveInput(sock);
 
     // Hash the password
-char hash[SHA256_DIGEST_LENGTH * 2 + 1];
-hash_password(password.c_str(), hash);
-
+    char hash[SHA256_DIGEST_LENGTH * 2 + 1];
+    hash_password(password.c_str(), hash);
 
     mtx.lock();
     // writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), password});
@@ -1021,12 +1021,20 @@ vector<vector<string>> ReservationHandler::viewTrips(int sock)
 
         if (isDateTimeAfterNow(dateTimeStr))
         {
-            int tripMinutes = getMinutesFromDateTime(dateTimeStr);
-            int timeDiff = tripMinutes - currentMinutes;
+            time_t tripTime = getTimeFromDateTime(dateTimeStr);
+            // int tripMinutes = getMinutesFromDateTime(dateTimeStr);
+            // int timeDiff = tripMinutes - currentMinutes;
+            // cout << timeDiff << endl;
+            // if (timeDiff <= 60 && timeDiff > 0)
+            time_t nowTime = time(nullptr);
+            int timeDiffMinutes = difftime(tripTime, nowTime) / 60;
 
-            if (timeDiff <= 60 && timeDiff > 0)
+            cout << "Time diff (mins): " << timeDiffMinutes << endl;
+
+            if (timeDiffMinutes <= 60 && timeDiffMinutes > 0)
             {
-                trip.push_back("⚠️ Less than 1 hour left! Price Decreased - Book Now!");
+                // trip.push_back("⚠️ Less than 1 hour left! Price Decreased - Book Now!");
+                trip[6] += " ⚠️ Less than 1 hour left! Price Decreased - Hurry!";
             }
 
             upcomingTrips.push_back(trip);
