@@ -37,19 +37,19 @@ This repository contains the Bus Reservation System Management project developed
 
 - User login Screen
 
-![Screenshot 1](screenshots/1.png.png "User Screen")
+![Screenshot 1](screenshots/1.png "User Screen")
 
 - Driver Login Screen
 
-![Screenshot 2](screenshots/2.png.png "Driver Screen")
+![Screenshot 2](screenshots/2.png "Driver Screen")
 
 - Upcoming trip detais
 
-![Screenshot 3](screenshots/3.png "Upcoming trips")
+![Screenshot 3](screenshots/4.png "Upcoming trips")
 
 - Book Ticket via bus matrix
 
-![Screenshot 4](screenshots/4.png "Book Ticket")
+![Screenshot 4](screenshots/3.png "Book Ticket")
 
 - Previous bookings
 
