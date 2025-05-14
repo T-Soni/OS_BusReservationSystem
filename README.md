@@ -28,7 +28,7 @@ This repository contains the Bus Reservation System Management project developed
 
 ## Features
 
-- **Trip Management**: Insert, view, and register trips.
+- **Bus Management**: Insert(for drivers), view, and register trips.
 - **Reservation System**: Book, view, and cancel reservations.
 - **File Handling**: Persist bus and reservation data using file handling techniques.
 - **User Interface**: Command-line based user interface for interacting with the system.
@@ -43,17 +43,17 @@ This repository contains the Bus Reservation System Management project developed
 
 ![Screenshot 2](screenshots/2.png "Driver Screen")
 
-- Upcoming trip detais
+- Previous Bookings
 
-![Screenshot 3](screenshots/4.png "Upcoming trips")
+![Screenshot 3](screenshots/4.png "Previous bookings")
 
 - Book Ticket via bus matrix
 
 ![Screenshot 4](screenshots/3.png "Book Ticket")
 
-- Previous bookings
+- Upcoming trip details
 
-![Screenshot 5](screenshots/5.png "Previous bookings")
+![Screenshot 5](screenshots/5.png "Upcoming trips")
 
 - Log out / Disconnect
 
