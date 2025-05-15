@@ -13,6 +13,13 @@
 #include <iomanip>
 #include <arpa/inet.h>
 #include <ctime>
+#include <math.h>
+#include <unordered_map>
+#include <fcntl.h> 
+#include <sys/select.h>
+#include <sys/time.h>
+#include <netinet/tcp.h>
+#include <regex>
 #include <openssl/sha.h>
 
 #define BROADCAST_PORT 9000
@@ -47,6 +54,8 @@ vector<vector<string>> readFile(const string &filename)
     }
     return data;
 }
+
+
 void hash_password(const char *password, char *output)
 {
     unsigned char hash[SHA256_DIGEST_LENGTH];
@@ -55,6 +64,34 @@ void hash_password(const char *password, char *output)
         sprintf(output + (i * 2), "%02x", hash[i]);
     output[SHA256_DIGEST_LENGTH * 2] = '\0';
 }
+string extractTime(const string &dateTime) {
+    // Example: "Thu May 15 06:45:00 2025" --> "06:45"
+    size_t timeStart = dateTime.find(':') - 2;
+    return dateTime.substr(timeStart, 5); // extracts "06:45"
+}
+string extractDateDDMMYYYY(const string &dateTime) {
+    // input: "Thu May 15 06:45:00 2025"
+    // output: "15/05/2025"
+    istringstream iss(dateTime);
+    string dayOfWeek, monthStr, dayStr, timeStr, yearStr;
+    iss >> dayOfWeek >> monthStr >> dayStr >> timeStr >> yearStr;
+
+    // Convert month name to number
+    map<string, string> monthMap = {
+        {"Jan", "01"}, {"Feb", "02"}, {"Mar", "03"}, {"Apr", "04"},
+        {"May", "05"}, {"Jun", "06"}, {"Jul", "07"}, {"Aug", "08"},
+        {"Sep", "09"}, {"Oct", "10"}, {"Nov", "11"}, {"Dec", "12"}
+    };
+
+    string month = monthMap[monthStr];
+
+    if (dayStr.length() == 1) dayStr = "0" + dayStr;
+
+    return dayStr + "/" + month + "/" + yearStr;
+}
+
+
+
 // Escape special characters in CSV
 string escapeCSV(const string &field)
 {
@@ -120,47 +157,164 @@ void updateFile(const string &filename, const vector<vector<string>> &data)
     outFile.close();
 }
 
-// Append row to CSV file
-void writeFile(const string &filename, const vector<string> &row)
-{
-    ofstream file(filename, ios::app);
-    if (!file)
-    {
-        cerr << "❌ Could not open file: " << filename << endl;
+void writeFile(const string &filename, const vector<string> &row) {
+    // Check if row is completely empty (i.e., all fields are empty)
+    bool isBlank = true;
+    for (const auto &field : row) {
+        if (!field.empty()) {
+            isBlank = false;
+            break;
+        }
+    }
+
+    if (row.empty() || isBlank) {
+        // Don't write empty or all-blank lines
         return;
     }
 
-    for (size_t i = 0; i < row.size(); ++i)
+    // First write using ofstream (for convenient formatting)
     {
-        file << escapeCSV(row[i]);
-        if (i < row.size() - 1)
-            file << ",";
+        ofstream file(filename, ios::app);
+        if (!file) {
+            cerr << "❌ Could not open file: " << filename << endl;
+            return;
+        }
+
+        for (size_t i = 0; i < row.size(); ++i) {
+            file << escapeCSV(row[i]);
+            if (i < row.size() - 1)
+                file << ",";
+        }
+        file << "\n";
+
+        // Flush C++ buffers
+        file.flush();
+    }  // ofstream closes here
+
+    // Then sync using file descriptor (POSIX)
+    int fd = open(filename.c_str(), O_WRONLY | O_APPEND);
+    if (fd != -1) {
+        fsync(fd);  // Force sync to disk
+        close(fd);
     }
-    file << "\n";
 }
+
 
 // ---------- Communication Functions ----------
 void sendPrompt(int sock, const string &msg)
 {
+    // 1. Clear any pending data in the socket buffer
+    char temp_buf[256];
+    while (recv(sock, temp_buf, sizeof(temp_buf), MSG_DONTWAIT) > 0) {}
+
+    // 2. Send the message
     send(sock, msg.c_str(), msg.length(), 0);
+
+    // 3. Force TCP buffer flush
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    // 4. Debug trace
     cout << "[SEND] " << msg << endl;
+
+    // 5. Brief delay to stabilize client receive
+    usleep(10000); // 10ms
+}
+
+void sendMessage(int sock, const string &message)
+{
+    send(sock, message.c_str(), message.size(), 0);
+    cout << "[SEND] " << message << endl;
 }
 
 string receiveInput(int sock)
 {
-    char buffer[4096];
-    int bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    int flag = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-    if (bytesReceived <= 0)
-    {
-        cout << "[RECV] Connection closed or no data.\n";
-        return "";
+    char buffer[8192];
+    string input;
+    int blankInputCount = 0;
+
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+
+        // Clear any unread junk in socket buffer
+        fd_set set;
+        struct timeval timeout = {0, 1000}; // 1ms
+        FD_ZERO(&set);
+        FD_SET(sock, &set);
+        while (select(sock + 1, &set, NULL, NULL, &timeout) > 0) {
+            recv(sock, buffer, sizeof(buffer) - 1, MSG_DONTWAIT);
+        }
+
+        int bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0);
+
+        if (bytesReceived == 0) {
+            cout << "[RECV] Client closed the connection.\n";
+            close(sock);
+            pthread_exit(NULL);
+        }
+        else if (bytesReceived < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(10000);
+                continue;
+            }
+            perror("[RECV] Error receiving data");
+            continue;
+        }
+
+        buffer[bytesReceived] = '\0';
+        input = string(buffer);
+
+        // Trim whitespace
+        size_t start = input.find_first_not_of(" \t\r\n");
+
+        /*
+        if (start == string::npos) {
+            blankInputCount++;
+            if (blankInputCount >= 2) {
+                // Allow 2nd blank input to break sync (consume junk)
+                cout << "[RECV] ⚠️  Second blank input detected. Consuming it to resync...\n";
+                blankInputCount = 0;
+                continue; // skip this input
+            } else {
+                sendPrompt(sock, "⚠️  Empty input. Please enter again:\nPROMPT@> ");
+                continue;
+            }
+        }
+        */
+
+        // If input was only spaces/newlines
+        if (start == string::npos) {
+            continue; // silently skip if you don't want to handle it anymore
+        }
+
+        size_t end = input.find_last_not_of(" \t\r\n");
+        input = input.substr(start, end - start + 1);
+
+        if (input == "A client got disconnected") {
+            cout << "⚠️  Client disconnected using Ctrl+C.\n";
+            close(sock);
+            pthread_exit(NULL);
+        }
+
+        cout << "[RECV] " << input << endl;
+        return input;
     }
-
-    buffer[bytesReceived] = '\0';
-    cout << "[RECV] " << buffer << endl;
-    return string(buffer);
 }
+
+
+
+// Ignoring Case 
+bool equalsIgnoreCase(const string a, const string b) {
+    string lowerA = a;
+    string lowerB = b;
+    transform(lowerA.begin(), lowerA.end(), lowerA.begin(), ::tolower);
+    transform(lowerB.begin(), lowerB.end(), lowerB.begin(), ::tolower);
+    return lowerA == lowerB;
+}   
+
 
 // UPDATING SEAT FILE BY LOCKING
 mutex seatLockMutex;
@@ -169,7 +323,7 @@ bool bookSeat(int sock, const string &tripId, const string &seatChoice, const st
 {
     string seatKey = tripId + "_" + seatChoice;
 
-    unique_lock<std::mutex> seatLock(seatLockMutex);
+    unique_lock<mutex> seatLock(seatLockMutex);
 
     string seatFile = "seat" + tripId + ".txt";
     auto seatData = readFile(seatFile);
@@ -193,8 +347,6 @@ bool bookSeat(int sock, const string &tripId, const string &seatChoice, const st
 
     // Update the seat data after booking
     updateFile(seatFile, seatData);
-
-    sendPrompt(sock, "✅ Seat " + seatChoice + " booked successfully.\n");
     return true;
 }
 
@@ -207,7 +359,7 @@ bool isAadharExist(const string &aadhar)
 {
     auto users = readFile(USER_FILE);
     for (const auto &row : users)
-        if (row.size() > 0 && row[1] == aadhar)
+        if (row.size() > 0 && row[0] == aadhar)
             return true;
     return false;
 } // d
@@ -272,10 +424,9 @@ time_t getTimeFromDateTime(const string &dateTimeStr)
     return mktime(&trip_tm); // full datetime in seconds since epoch
 }
 
-// SEAT MATRIX PRINTING
+//Printing the SEAT MATRIX 
 
-void seatMatrix(const string &tripId, int rows, int cols, int sock)
-{
+void seatMatrix(const string &tripId, int rows, int cols, int sock) {
     string seatFile = "seat" + tripId + ".txt";
     auto seatData = readFile(seatFile); // Load seat data
 
@@ -284,7 +435,7 @@ void seatMatrix(const string &tripId, int rows, int cols, int sock)
 
     // GATE and driver header
     stringstream ss;
-    ss << "\n|-------------------------------|";
+    ss << "\n|===============================|";
     ss << "\n| G               Driver Seat   |";
     ss << "\n| A                             |";
     ss << "\n| T                             |";
@@ -297,8 +448,7 @@ void seatMatrix(const string &tripId, int rows, int cols, int sock)
     int totalSeats = rows * cols;
     int seatIndex = 0;
 
-    for (int row = 0; row < rows; ++row)
-    {
+    for (int row = 0; row < rows; ++row) {
         stringstream iconLine;
         stringstream numberLine;
 
@@ -306,17 +456,13 @@ void seatMatrix(const string &tripId, int rows, int cols, int sock)
         numberLine << "|";
 
         // Left side
-        for (int i = 0; i < leftCols; ++i)
-        {
-            if (seatIndex < seatData.size() && seatData[seatIndex].size() >= 2)
-            {
+        for (int i = 0; i < leftCols; ++i) {
+            if (seatIndex < seatData.size() && seatData[seatIndex].size() >= 2) {
                 string status = seatData[seatIndex][1];
                 string seatIcon = (status == "0") ? "💺" : "❌";
                 iconLine << setw(2) << seatIcon << " ";
                 numberLine << setw(2) << setfill('0') << seatData[seatIndex][0] << " ";
-            }
-            else
-            {
+            } else {
                 iconLine << setw(3) << " ";
                 numberLine << setw(3) << " ";
             }
@@ -329,17 +475,13 @@ void seatMatrix(const string &tripId, int rows, int cols, int sock)
         numberLine << string(aisleSpacing, ' ');
 
         // Right side
-        for (int i = 0; i < rightCols; ++i)
-        {
-            if (seatIndex < seatData.size() && seatData[seatIndex].size() >= 2)
-            {
+        for (int i = 0; i < rightCols; ++i) {
+            if (seatIndex < seatData.size() && seatData[seatIndex].size() >= 2) {
                 string status = seatData[seatIndex][1];
                 string seatIcon = (status == "0") ? "💺" : "❌";
                 iconLine << setw(2) << seatIcon << " ";
                 numberLine << setw(2) << setfill('0') << seatData[seatIndex][0] << " ";
-            }
-            else
-            {
+            } else {
                 iconLine << setw(3) << " ";
                 numberLine << setw(3) << " ";
             }
@@ -352,9 +494,64 @@ void seatMatrix(const string &tripId, int rows, int cols, int sock)
         response << iconLine.str() << "\n";
         response << numberLine.str() << "\n";
     }
-
+    response << "\n|===============================|";
     response << "\n 💺 = Available, ❌ = Booked\n";
-    sendPrompt(sock, response.str());
+
+    // Collect price details
+    string windowPrice = "N/A";
+    string middlePrice = "N/A";
+    string backWindowPrice = "N/A";
+    string backMiddlePrice = "N/A";
+
+    if (!seatData.empty()) {
+        // Window seat (first seat)
+        if (seatData[0].size() >= 3) {
+            windowPrice = seatData[0][2];
+        }
+
+        // Middle seat (if cols > 2)
+        if (cols > 2) {
+            if (seatData.size() > 1 && seatData[1].size() >= 3) {
+                middlePrice = seatData[1][2];
+            } else {
+                middlePrice = "N/A";
+            }
+        }
+
+        // Back window seat
+        int backRowIndex = (rows - 1) * cols;
+        if (backRowIndex < seatData.size() && seatData[backRowIndex].size() >= 3) {
+            backWindowPrice = seatData[backRowIndex][2];
+        }
+
+        // Back middle seat (if cols > 2)
+        if (cols > 2) {
+            int backMiddleIndex = backRowIndex + 1;
+            if (backMiddleIndex < seatData.size() && seatData[backMiddleIndex].size() >= 3) {
+                backMiddlePrice = seatData[backMiddleIndex][2];
+            } else {
+                backMiddlePrice = "N/A";
+            }
+        }
+    }
+
+    // Build the price details response
+    response << "\n IMPORTANT PRICE DETAILS\n";
+    if (cols > 2) {
+        response << "1. LOWER PRICE FOR MIDDLE SEATS: " << middlePrice << "\n";
+    } else {
+        response << "1. LOWER PRICE FOR MIDDLE SEATS: Not applicable (no middle seats in 2-column layout)\n";
+    }
+
+    response << "2. MORE LOWER PRICES FOR BACK SEATS -> BACK WINDOW: " << backWindowPrice;
+    if (cols > 2) {
+        response << ", BACK MIDDLE: " << backMiddlePrice;
+    }
+    response << "\n";
+
+    response << "3. PRICE HIKE FOR WINDOW SEATS: " << windowPrice << "\n";
+
+    sendMessage(sock, response.str());
 }
 
 // --- CLASS DECLARATIONS ---
@@ -399,22 +596,36 @@ public:
 
     void registerBus(int sock);
     void insertTrip(int sock);
-    void createSeatFile(const string &tripId, int row, int col);
+    void createSeatFile(const string &tripId, int row, int col,float dist);
 
 private:
     string generateTripID()
-    {
-        static int tripCount = 1;
-        auto trips = readFile(TRIPS_FILE);
-        tripCount += trips.size();
-        stringstream ss;
-        ss << "T" << setfill('0') << setw(3) << tripCount;
-        return ss.str();
+    {       
+    auto trips = readFile(TRIPS_FILE);
+    int maxID = 0;
+
+    std::regex idPattern(R"(T(\d+))");
+
+    for (const auto& trip : trips) {
+        if (trip.empty()) continue;
+
+        std::smatch match;
+        if (std::regex_match(trip[0], match, idPattern)) {
+            int idNum = std::stoi(match[1]);
+            if (idNum > maxID) {
+                maxID = idNum;
+            }
+        }
     }
+
+    stringstream ss;
+    ss << "T" << setfill('0') << setw(3) << (maxID + 1);
+    return ss.str();
+}
 }; // d
 
 // --------- Create Seat File Function----------
-void bus_trip_handler::createSeatFile(const string &tripId, int rows, int cols)
+void bus_trip_handler::createSeatFile(const string &tripId, int rows, int cols, float dist)
 {
     int k = 1;
     for (int r = 0; r < rows; r++)
@@ -424,25 +635,29 @@ void bus_trip_handler::createSeatFile(const string &tripId, int rows, int cols)
             string seatNum = to_string(k);
             string status = "0";
 
-            int price;
+            int baseprice;
 
             // Check for back row seats first
             if ((r == rows - 1) && (c == 0 || c == cols - 1))
             {
-                price = 120; // Back window seats
+                baseprice = 105; // Back window seats
             }
             else if (r == rows - 1)
             {
-                price = 100; // Back middle seats
+                baseprice = 100; // Back middle seats
             }
             else if (c == 0 || c == cols - 1)
             {
-                price = 150; // Window seats (not back row)
+                baseprice = 150; // Window seats (not back row)
             }
             else
             {
-                price = 120; // Middle seats (not back row)
+                baseprice = 120; // Middle seats (not back row)
             }
+
+            // Calculate price based on distance
+            int multiplier = ceil(dist / 80.0);
+            int price = baseprice * multiplier;
 
             vector<string> row = {seatNum, status, to_string(price)};
             writeFile("seat" + tripId + ".txt", row);
@@ -456,52 +671,52 @@ void bus_trip_handler::createSeatFile(const string &tripId, int rows, int cols)
 //------------USER REGISTER--------------------------
 void User::registerUser(int sock)
 {
-    sendPrompt(sock, "Enter your Name:");
+    sendPrompt(sock, "Enter your Name:PROMPT@");
     string name = receiveInput(sock);
 
     int age = 0;
     while (true)
     {
-        sendPrompt(sock, "Enter your Age:");
+        sendPrompt(sock, "Enter your Age:PROMPT@");
         string ageinput = receiveInput(sock);
         try
         {
             age = stoi(ageinput);
             if (age < 1)
-                sendPrompt(sock, "Children below 1 year of age are not eligible for safety concerns.\n");
+                sendMessage(sock, "Children below 1 year of age are not eligible for safety concerns.\n");
             else if (age > 150)
-                sendPrompt(sock, "❌ Enter realistic age data.\n");
+                sendMessage(sock, "❌ Enter realistic age data.\n");
             else
                 break;
         }
         catch (invalid_argument &e)
         {
-            sendPrompt(sock, "❌ Invalid input. Please enter a number for age.\n");
+            sendMessage(sock, "❌ Invalid input. Please enter a number for age.\n");
         }
     }
 
     string aadhar;
     while (true)
     {
-        sendPrompt(sock, "Enter your Unique Aadhar number:");
+        sendPrompt(sock, "Enter your Unique Aadhar number:PROMPT@");
         aadhar = receiveInput(sock);
         if (!isValidAadhar(aadhar))
         {
-            sendPrompt(sock, "❌ Invalid Aadhar number. It must be 12 digits.\n");
+            sendMessage(sock, "❌ Invalid Aadhar number. It must be 12 digits.\n");
             continue;
         }
         if (isAadharExist(aadhar))
         {
-            sendPrompt(sock, "This Aadhar number is already registered.\nIs it a Typo error? (y/n): ");
+            sendPrompt(sock, "This Aadhar number is already registered.\nIs it a Typo error? (y/n): PROMPT@");
             string ans = receiveInput(sock);
             if (ans == "y" || ans == "Y")
             {
-                sendPrompt(sock, "No worries, Re-enter again.\n");
+                sendMessage(sock, "No worries, Re-enter again.\n");
                 continue;
             }
             else
             {
-                sendPrompt(sock, "You're already registered. Please login instead.\n");
+                sendMessage(sock, "You're already registered. Please login instead.\n");
                 return;
             }
         }
@@ -511,28 +726,26 @@ void User::registerUser(int sock)
         }
     }
 
-    sendPrompt(sock, "Enter a Strong Password:");
+    sendPrompt(sock, "Enter a Strong Password:PROMPT@");
     string password = receiveInput(sock);
 
-    // mtx.lock();
-    // writeFile(USER_FILE, {aadhar, name, to_string(age), password});
-    // mtx.unlock();
-    // Hash the password
+     // Hash the password
     char hash[SHA256_DIGEST_LENGTH * 2 + 1];
     hash_password(password.c_str(), hash);
 
     mtx.lock();
+    // writeFile(USER_FILE, {aadhar, name, to_string(age), password});
     writeFile(USER_FILE, {aadhar, name, to_string(age), string(hash)});
     mtx.unlock();
-    sendPrompt(sock, "✅ Registration Successful!\n");
+    sendMessage(sock, "✅ Registration Successful!\n");
 } // d
 
 //----------USER LOGIN----------------
 string User::login(int sock)
 {
-    sendPrompt(sock, "Enter Your Aadhar Number:");
+    sendPrompt(sock, "Enter Your Aadhar Number:PROMPT@");
     string aadhar = receiveInput(sock);
-    sendPrompt(sock, "Enter Your Password:");
+    sendPrompt(sock, "Enter Your Password:PROMPT@");
     string password = receiveInput(sock);
 
     // Hash the entered password
@@ -547,12 +760,12 @@ string User::login(int sock)
         // if (row[0] == aadhar && row[3] == password)
         if (row[0] == aadhar && row[3] == hashedPassword)
         {
-            sendPrompt(sock, "✅ Login Successful!\n");
+            sendMessage(sock, "✅ Login Successful!\n");
             return aadhar;
         }
     }
 
-    sendPrompt(sock, "❌ Invalid Aadhar number or Password.\n");
+    sendMessage(sock, "❌ Invalid Aadhar number or Password.\n");
     return "";
 } // d
 
@@ -562,26 +775,26 @@ void Driver::registerDriver(int sock)
 {
 
     // Asking for name
-    sendPrompt(sock, "Enter your Name:");
+    sendPrompt(sock, "Enter your Name:PROMPT@");
     string name = receiveInput(sock);
 
     // asking for age
     int age = 0;
     while (true)
     {
-        sendPrompt(sock, "Enter your Age:");
+        sendPrompt(sock, "Enter your Age:PROMPT@");
         string ageinput = receiveInput(sock);
         try
         {
             age = stoi(ageinput);
             if (age < 25 || age > 60)
-                sendPrompt(sock, "Not Eligible to register here as a driver.\n");
+                sendMessage(sock, "Not Eligible to register here as a driver.\n");
             else
                 break;
         }
         catch (invalid_argument &e)
         {
-            sendPrompt(sock, "❌ Invalid input. Please enter a number for age.\n");
+            sendMessage(sock, "❌ Invalid input. Please enter a number for age.\n");
         }
     }
 
@@ -589,25 +802,25 @@ void Driver::registerDriver(int sock)
     string aadhar;
     while (true)
     {
-        sendPrompt(sock, "Enter your Unique Aadhar number:");
+        sendPrompt(sock, "Enter your Unique Aadhar number:PROMPT@");
         aadhar = receiveInput(sock);
         if (!isValidAadhar(aadhar))
         {
-            sendPrompt(sock, "❌ Invalid Aadhar number. It must be 12 digits.\n");
+            sendMessage(sock, "❌ Invalid Aadhar number. It must be 12 digits.\n");
             continue;
         }
         if (isAadharExist(aadhar))
         {
-            sendPrompt(sock, "This Aadhar number is already registered.\nIs it a Typo error? (y/n): ");
+            sendPrompt(sock, "This Aadhar number is already registered.\nIs it a Typo error? (y/n): PROMPT@");
             string ans = receiveInput(sock);
             if (ans == "y" || ans == "Y")
             {
-                sendPrompt(sock, "No worries, Re-enter again.\n");
+                sendMessage(sock, "No worries, Re-enter again.\n");
                 continue;
             }
             else
             {
-                sendPrompt(sock, "You're already registered. Please login instead.\n");
+                sendMessage(sock, "You're already registered. Please login instead.\n");
                 return;
             }
         }
@@ -621,25 +834,25 @@ void Driver::registerDriver(int sock)
     string license;
     while (true)
     {
-        sendPrompt(sock, "Enter your Unique License number:");
+        sendPrompt(sock, "Enter your Unique License number:PROMPT@");
         license = receiveInput(sock);
         if (!isValidLicense(license))
         {
-            sendPrompt(sock, "❌ Invalid License number.\n");
+            sendMessage(sock, "❌ Invalid License number.\n");
             continue;
         }
         if (isLicenseExist(license))
         {
-            sendPrompt(sock, "This License number is already registered.\nIs it a Typo error? (y/n): ");
+            sendPrompt(sock, "This License number is already registered.\nIs it a Typo error? (y/n): PROMPT@");
             string ans = receiveInput(sock);
             if (ans == "y" || ans == "Y")
             {
-                sendPrompt(sock, "No worries, Re-enter again.\n");
+                sendMessage(sock, "No worries, Re-enter again.\n");
                 continue;
             }
             else
             {
-                sendPrompt(sock, "You're already registered. Please login instead.\n");
+                sendMessage(sock, "You're already registered. Please login instead.\n");
                 return;
             }
         }
@@ -649,7 +862,7 @@ void Driver::registerDriver(int sock)
         }
     }
 
-    sendPrompt(sock, "Enter a Strong Password:");
+    sendPrompt(sock, "Enter a Strong Password:PROMPT@");
     string password = receiveInput(sock);
 
     // Hash the password
@@ -657,10 +870,10 @@ void Driver::registerDriver(int sock)
     hash_password(password.c_str(), hash);
 
     mtx.lock();
-    // writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), password});
     writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), string(hash)});
+    // writeFile(DRIVER_FILE, {aadhar, license, name, to_string(age), password});
     mtx.unlock();
-    sendPrompt(sock, "✅ Registration Successful!\n");
+    sendMessage(sock, "✅ Registration Successful!\n");
 } // d
 
 //--------------LOGIN DRIVER-----------------
@@ -674,10 +887,10 @@ string trim(const string &s)
 }
 string Driver::loginDriver(int sock)
 {
-    sendPrompt(sock, "Enter Your Aadhar Number:");
+    sendPrompt(sock, "Enter Your Aadhar Number:PROMPT@");
     string aadhar = trim(receiveInput(sock));
 
-    sendPrompt(sock, "Enter Your Password:");
+    sendPrompt(sock, "Enter Your Password:PROMPT@");
     string password = trim(receiveInput(sock));
 
     // Hash the entered password
@@ -697,12 +910,12 @@ string Driver::loginDriver(int sock)
         if (storedAadhar == aadhar && storedPassword == hashedPassword)
         // if (storedAadhar == aadhar && storedPassword == password)
         {
-            sendPrompt(sock, "✅ Login Successful!\n");
+            sendMessage(sock, "✅ Login Successful!\n");
             return storedAadhar;
         }
     }
 
-    sendPrompt(sock, "❌ Invalid Aadhar number or Password.\n");
+    sendMessage(sock, "❌ Invalid Aadhar number or Password.\n");
     return "";
 }
 
@@ -776,22 +989,35 @@ bool validateAndCompareDate(const string &departDate, time_t &timestamp, const s
     return true;
 }
 
+//-----------INSERT TRIPS----------------
 void bus_trip_handler::insertTrip(int sock)
 {
-    sendPrompt(sock, "Enter Bus Number: ");
+    sendPrompt(sock, "Enter Bus Number: PROMPT@");
     string busNo = receiveInput(sock);
 
-    sendPrompt(sock, "Enter Source: ");
+    sendPrompt(sock, "Enter Source: PROMPT@");
     string source = receiveInput(sock);
 
-    sendPrompt(sock, "Enter Destination: ");
+    sendPrompt(sock, "Enter Destination: PROMPT@");
     string destination = receiveInput(sock);
 
-    sendPrompt(sock, "Enter Departure Date (DD/MM/YYYY): ");
+    sendPrompt(sock, "Enter Departure Date (DD/MM/YYYY): PROMPT@");
     string departDate = receiveInput(sock);
 
-    sendPrompt(sock, "Enter Start Time (HH:MM): ");
+    sendPrompt(sock, "Enter Start Time (HH:MM): PROMPT@");
     string startTime = receiveInput(sock);
+
+    sendPrompt(sock,"Enter the Total Distance being covered in KM:PROMPT@");
+    string distance = receiveInput(sock);
+    float dist;
+    try
+        {
+            dist = stof(distance);
+        }
+        catch (invalid_argument &e)
+        {
+            sendMessage(sock, "❌ Invalid input. Please enter a number\n");
+        }
 
     auto buses = readFile("buses.txt");
     int rows = -1, cols = -1;
@@ -808,7 +1034,7 @@ void bus_trip_handler::insertTrip(int sock)
     string departure = "";
     if (validateAndCompareDate(departDate, timestamp, startTime) == false)
     {
-        sendPrompt(sock, "❌ Departure date or time invalid.\n");
+        sendMessage(sock, "❌ Departure date or time invalid.\n");
         return;
     }
     else
@@ -823,39 +1049,46 @@ void bus_trip_handler::insertTrip(int sock)
 
     if (rows <= 0 || cols <= 0)
     {
-        sendPrompt(sock, "❌ Bus not found or invalid seat dimensions.\n");
+        sendMessage(sock, "❌ Bus not found or invalid seat dimensions.\n");
         return;
     }
 
     auto trips = readFile("trips.txt");
     for (auto &trip : trips)
     {
-        if (trip.size() == 6 && trip[1] == busNo)
+        if (trip.size() == 7 && trip[1] == busNo)
         {
-            string existingTime = trip[4];
+            string existingDateTime = trip[6];
+        string existingDate = extractDateDDMMYYYY(existingDateTime);
 
+        if (existingDate == departDate)
+        {
+            string existingTime = extractTime(existingDateTime);  // "HH:MM"
+            
             if (!isTimeDifferenceSafe(existingTime, startTime))
             {
-                sendPrompt(sock, "❌ A trip with this bus is already scheduled around the same time (within 60 minutes).\n");
+                sendPrompt(sock, "❌ A trip with this bus is already scheduled on the same date within 60 minutes.\n");
                 return;
             }
         }
+        }
     }
+
     string tripID = generateTripID();
 
     mtx.lock();
-    writeFile(TRIPS_FILE, {tripID, busNo, source, destination, startTime, aadhar, departure});
+    writeFile(TRIPS_FILE, {tripID, busNo, source, destination, distance, aadhar, departure});
     mtx.unlock();
     // creating seat file (rows and cols are int)
-    createSeatFile(tripID, rows, cols);
+    createSeatFile(tripID, rows, cols,dist);
 
-    sendPrompt(sock, "✅ A Trip is being inserted successfully with Trip ID: " + tripID + "\n");
+    sendMessage(sock, "✅ A Trip is being inserted successfully with Trip ID " + tripID + "\n");
 } // d
 
 //-----------Register a bus-------------
 void bus_trip_handler::registerBus(int sock)
 {
-    sendPrompt(sock, "Enter Bus Number (unique ID): ");
+    sendPrompt(sock, "Enter Bus Number (unique ID): PROMPT@");
     string busNo = receiveInput(sock);
 
     // Check if busNo already exists
@@ -870,11 +1103,11 @@ void bus_trip_handler::registerBus(int sock)
     }
 
     // Get rows
-    sendPrompt(sock, "Enter number of seat rows: ");
+    sendPrompt(sock, "Enter number of seat rows: PROMPT@");
     string rowStr = receiveInput(sock);
 
     // Get columns
-    sendPrompt(sock, "Enter number of seat columns: ");
+    sendPrompt(sock, "Enter number of seat columns: PROMPT@");
     string colStr = receiveInput(sock);
 
     // Validate inputs
@@ -885,7 +1118,7 @@ void bus_trip_handler::registerBus(int sock)
 
         if (rows <= 0 || cols <= 0)
         {
-            sendPrompt(sock, "❌ Invalid row or column count for a bus\n");
+            sendMessage(sock, "❌ Invalid row or column count for a bus\n");
             return;
         }
 
@@ -893,7 +1126,7 @@ void bus_trip_handler::registerBus(int sock)
         writeFile("buses.txt", {busNo, aadhar, rowStr, colStr});
         mtx.unlock();
 
-        sendPrompt(sock, "✅ Bus registered successfully.\n");
+        sendMessage(sock, "✅ Bus registered successfully.\n");
     }
     catch (...)
     {
@@ -958,7 +1191,6 @@ void ReservationHandler::viewTickets(int sock)
 
             string source = tripInfo[2];
             string destination = tripInfo[3];
-            string startTime = tripInfo[4];
             string departure = tripInfo[6];
 
             response += "-----------------------------------------\n";
@@ -972,7 +1204,6 @@ void ReservationHandler::viewTickets(int sock)
             response += "Booking Time  : " + bookingTime + "\n";
             response += "-----------------------------------------\n";
             response += "Route         : " + source + " ➡ " + destination + "\n";
-            response += "Departure Time: " + startTime + "\n";
             response += "Departure Date: " + departure + "\n";
             response += "=========================================\n\n";
         }
@@ -983,7 +1214,7 @@ void ReservationHandler::viewTickets(int sock)
         response = "❌ No bookings found under your ID.\n";
     }
 
-    sendPrompt(sock, response);
+    sendMessage(sock, response);
 }
 
 //-----------VIEW TRIPS--------------
@@ -1033,8 +1264,8 @@ vector<vector<string>> ReservationHandler::viewTrips(int sock)
 
             if (timeDiffMinutes <= 60 && timeDiffMinutes > 0)
             {
-                // trip.push_back("⚠️ Less than 1 hour left! Price Decreased - Book Now!");
-                trip[6] += " ⚠️ Less than 1 hour left! Price Decreased - Hurry!";
+                
+                trip[6] += " [ DISCOUNT-⚠️ Less than 1 hour left! Price Decreased - Hurry!]";
             }
 
             upcomingTrips.push_back(trip);
@@ -1043,266 +1274,232 @@ vector<vector<string>> ReservationHandler::viewTrips(int sock)
 
     if (upcomingTrips.empty())
     {
-        sendPrompt(sock, "❌ No upcoming trips are available.\n");
+        sendMessage(sock, "❌ No upcoming trips are available.\n");
     }
 
     return upcomingTrips;
 } // d
 
-//------------RESERVE TICKET------------------
 
-void ReservationHandler::reserve(int sock)
+//------------RESERVE TICKET------------------
+bool validate(string aadhar, string name)
 {
-    while (true)
-    { // Main loop for trip selection
+ bool registered = false;
+     auto users = readFile(USER_FILE);
+         for (auto &user : users)
+          {
+           if (user.size() >= 2 && user[0] == aadhar && equalsIgnoreCase(user[1],name))
+                {
+                  registered = true;
+                  break;
+                 }
+          }
+    return registered;
+}
+
+void ReservationHandler::reserve(int sock) {
+
+    while (true) {
         vector<vector<string>> available = viewTrips(sock);
-        if (available.empty())
-        {
-            sendPrompt(sock, "No upcoming Buses available\n");
+        if (available.empty()) {
+            sendMessage(sock, "No upcoming buses available\n");
             return;
         }
 
         // Build trip list with pricing info
-        string tripOptions = "🚌 Upcoming Trips:\n";
-        vector<string> tripPrices; // Store base prices for each trip
-        for (size_t i = 0; i < available.size(); ++i)
-        {
-            auto &t = available[i];
-            string priceNote = "";
-            if (t.size() > 6)
-            { // Check for time-sensitive pricing
-                priceNote = " [" + t[6] + "]";
-            }
-            tripOptions += to_string(i + 1) + ". Trip ID: " + t[0] +
-                           ", Bus No: " + t[1] +
-                           ", From: " + t[2] +
-                           ", To: " + t[3] +
-                           ", Start Time: " + t[4] +
-                           priceNote + "\n";
-        }
-        sendPrompt(sock, tripOptions);
-
+        string tripOptions = "\n====================================\n"
+                            "         🚌 Upcoming Trips          \n"
+                            "------------------------------------\n\n";
+        unordered_map<string, bool> hasDiscount;
         vector<string> tripIds;
-        for (auto &trip : available)
-        {
-            tripIds.push_back(trip[0]);
+        
+        for (size_t i = 0; i < available.size(); ++i) {
+            auto& t = available[i];
+            string priceNote = "";
+            bool discount = false;
+            if (t.size() == 7 && t[6].find("DISCOUNT") != string::npos) 
+            discount = true;
+            
+            tripOptions += to_string(i+1) + ". " + t[0] + " | " + t[1] + " | " + t[2] 
+                        + " → " + t[3] + " | " + t[6] +"\n";
+            tripIds.push_back(t[0]);
+            hasDiscount[t[0]] = discount;
         }
+        sendMessage(sock, tripOptions);
 
-        string currentTripId;
-        string busNo;
+        // Trip selection
+        string currentTripId, busNo;
         int rows = 0, cols = 0;
-        string startTime;
-        float priceMultiplier = 1.0f;
+        
+        while (true) {
+            try {
+                sendPrompt(sock, "\nEnter Trip ID (r to refresh trips /e to exit from here): PROMPT@");
+                string input = receiveInput(sock);
 
-        // Trip selection loop
-        while (true)
-        {
-            sendPrompt(sock, "\nEnter a Trip ID to book or commands:\n- 'r' refresh trips\n- 'e' exit\n");
-            string input = receiveInput(sock);
+                if (input == "e") {
+                    sendMessage(sock, "Exiting...\n");
+                    return;
+                }
+                if (input == "r") break;
 
-            if (input == "e")
-            {
-                sendPrompt(sock, "Thanks, exiting! Visit again.\n");
-                return;
-            }
-            if (input == "r")
-                break; // Refresh trip list
+                auto it = find(tripIds.begin(), tripIds.end(), input);
+                if (it == tripIds.end()) {
+                    sendMessage(sock, "❌ Invalid Trip ID\n");
+                    continue;
+                }
 
-            auto tripIt = find(tripIds.begin(), tripIds.end(), input);
-            if (tripIt == tripIds.end())
-            {
-                sendPrompt(sock, "❌ Invalid Trip ID. Please try again.\n");
-                continue;
-            }
-
-            // Get trip details
-            currentTripId = input;
-            for (const auto &trip : available)
-            {
-                if (trip[0] == currentTripId)
-                {
-                    busNo = trip[1];
-                    startTime = trip[4];
-
-                    if (trip.size() > 6)
-                    {
-                        string fullTripDateTimeStr = trip[6];
-
-                        // Remove newline if any
-                        if (!fullTripDateTimeStr.empty() && fullTripDateTimeStr.back() == '\n')
-                        {
-                            fullTripDateTimeStr.pop_back();
-                        }
-
-                        // Convert string to time_t
-                        struct tm tripTimeStruct{};
-                        if (strptime(fullTripDateTimeStr.c_str(), "%a %b %d %H:%M:%S %Y", &tripTimeStruct) == nullptr)
-                        {
-                            sendPrompt(sock, "⚠️ Unable to parse trip date.\n");
-                            return;
-                        }
-                        time_t tripTime = mktime(&tripTimeStruct);
-
-                        time_t now = time(0);
-
-                        if (difftime(tripTime, now) <= 0)
-                        {
-                            sendPrompt(sock, "⚠️ This trip has already departed. Please select another one.\n");
-                            currentTripId = "";
+                currentTripId = input;
+                // Validate trip time and get details
+                for (auto& trip : available) {
+                    if (trip[0] == currentTripId) {
+                        busNo = trip[1];
+                        string datetimeStr = trip[6];
+                        
+                        // Time validation
+                        tm tripTm = {};
+                        istringstream ss(datetimeStr);
+                        ss >> get_time(&tripTm, "%a %b %d %H:%M:%S %Y");
+                        time_t tripTime = mktime(&tripTm);
+                        
+                        if (difftime(tripTime, time(nullptr)) <= 0) {
+                            sendMessage(sock, "⚠️ Trip has departed!\n");
+                            currentTripId.clear();
                             break;
                         }
-                    }
-                    // Check for time discount
-                    time_t now = time(0);
-                    tm *ltm = localtime(&now);
-                    int currentMinutes = ltm->tm_hour * 60 + ltm->tm_min;
-                    int tripMinutes = timeToMinutes(startTime);
-
-                    if ((tripMinutes - currentMinutes) <= 60 && (tripMinutes - currentMinutes) > 0)
-                    {
-                        priceMultiplier = 0.9f;
-                    }
-                    else
-                    {
-                        priceMultiplier = 1.0f;
-                    }
-                    break;
-                }
-            }
-
-            // Get bus layout
-            auto buses = readFile(BUS_FILE);
-            for (const auto &b : buses)
-            {
-                cout << "[DEBUG] b[0] = '" << b[0] << "', busNo = '" << busNo << "'" << endl;
-
-                if (b.size() == 4 && b[0] == busNo)
-                {
-                    rows = stoi(b[2]);
-                    cols = stoi(b[3]);
-                    break;
-                }
-            }
-
-            seatMatrix(currentTripId, rows, cols, sock);
-            break;
-        }
-
-        if (currentTripId.empty())
-            continue;
-
-        // Seat booking loop
-        while (true)
-        {
-            auto seatData = readFile("seat" + currentTripId + ".txt");
-            sendPrompt(sock, "Choose seat numbers one by one\nCommands:\n- 'c' change trip\n- Seat number for seat Booking\n- 'e' exit\n");
-
-            string seatChoice = receiveInput(sock);
-            if (seatChoice == "c")
-                break; // Change trip
-            if (seatChoice == "e")
-            {
-                sendPrompt(sock, "Thanks, exiting! Visit again.\n");
-                return;
-            }
-            if (seatChoice == "v")
-            {
-                seatMatrix(currentTripId, rows, cols, sock);
-                continue;
-            }
-
-            // Seat validation
-            bool seatFound = false;
-            for (auto &seat : seatData)
-            {
-                if (seat.size() >= 3 && seat[0] == seatChoice && seat[1] == "0")
-                {
-                    seatFound = true;
-                    float basePrice = stof(seat[2]);
-                    float finalPrice = basePrice * priceMultiplier;
-
-                    // Passenger registration check
-                    while (true)
-                    {
-                        sendPrompt(sock, "Enter Passenger Name: ");
-                        string name = receiveInput(sock);
-                        sendPrompt(sock, "Enter Aadhar Number: ");
-                        string aadhar = receiveInput(sock);
-
-                        bool registered = false;
-                        auto users = readFile(USER_FILE);
-                        for (auto &user : users)
-                        {
-                            if (user.size() >= 2 && user[0] == aadhar && user[1] == name)
-                            {
-                                registered = true;
+                        
+                        // Get bus layout
+                        auto buses = readFile(BUS_FILE);
+                        for (auto& b : buses) {
+                            if (b.size() >= 4 && b[0] == busNo) {
+                                rows = stoi(b[2]);
+                                cols = stoi(b[3]);
                                 break;
-                            }
-                        }
-
-                        if (!registered)
-                        {
-                            sendPrompt(sock, "❌ Passenger not registered. Try again or:\n- 'c' cancel booking\n");
-                            string cmd = receiveInput(sock);
-                            if (cmd == "c")
-                                break;
-                            continue;
-                        }
-
-                        // Confirm price
-                        stringstream priceMsg;
-                        priceMsg << "Final price: Rs" << fixed << setprecision(2) << finalPrice;
-                        if (priceMultiplier < 1.0f)
-                        {
-                            priceMsg << " (10% discount applied!)";
-                        }
-                        sendPrompt(sock, priceMsg.str() + "\nConfirm booking? (y/n): ");
-
-                        if (receiveInput(sock) == "y")
-                        {
-                            time_t timestamp;
-                            time(&timestamp);
-                            if (bookSeat(sock, currentTripId, seatChoice, aadhar, name))
-                            {
-                                string timeStr = ctime(&timestamp);
-                                timeStr.pop_back(); // remove trailing '/n'
-                                vector<string> booking = {
-                                    currentTripId,
-                                    busNo,
-                                    seatChoice,
-                                    aadhar,
-                                    name,
-                                    to_string(finalPrice),
-                                    timeStr};
-                                writeFile(BOOKING_FILE, booking);
-
-                                sendPrompt(sock, "✅ Seat " + seatChoice + " booked successfully on " + timeStr + "\n");
                             }
                         }
                         break;
                     }
-                    break;
+                }
+                if (!currentTripId.empty()) break;
+            }
+            catch (const invalid_argument&) {
+                sendMessage(sock, "❌ Input cannot be blank!\n");
+            }
+        }
+
+        if (currentTripId.empty()) continue;
+
+        // Seat booking
+        bool returnToTrips = false;
+        while (!returnToTrips) {
+            seatMatrix(currentTripId, rows, cols, sock);
+
+            try {
+                sendPrompt(sock, "\nChoose seat (c to change trip /e to exit /seat#): PROMPT@");
+                string seatChoice = receiveInput(sock);
+
+                if (seatChoice == "c") { returnToTrips = true; break; }
+                if (seatChoice == "e") return;
+                if (seatChoice == "v") continue;
+
+                // Validate seat
+                auto seatData = readFile("seat" + currentTripId + ".txt");
+                bool validSeat = false;
+                float basePrice = 0.0f;
+                
+                for (auto& seat : seatData) {
+                    if (seat.size() >= 3 && seat[0] == seatChoice && seat[1] == "0") {
+                        validSeat = true;
+                        basePrice = stof(seat[2]);
+                        break;
+                    }
+                }
+
+                if (!validSeat) {
+                    sendMessage(sock, "❌ Invalid/occupied seat\n");
+                    continue;
+                }
+
+                // Passenger details
+                string name, aadhar;
+              while(true)
+              {
+                        sendPrompt(sock, "Passenger Name:PROMPT@");
+                        name = receiveInput(sock);                     
+              
+                        sendPrompt(sock, "Aadhar Number:PROMPT@");
+                        aadhar = receiveInput(sock);
+                bool registered=validate(aadhar,name);
+                if(registered)break;
+                else
+                sendMessage(sock,"\n ❌ ENTER A REGISTERED USER\n");
+              }
+                // Price calculation
+                bool applyDiscount = hasDiscount[currentTripId];
+                float finalPrice = applyDiscount ? basePrice * 0.9f : basePrice;
+                
+                stringstream priceMsg;
+                priceMsg << "💰 Final Price: Rs" << fixed << setprecision(2) << finalPrice;
+                if (applyDiscount) {
+                    priceMsg << " (10% discount applied!)";
+                }
+
+                // Confirmation
+                string confirm;
+                while (true) {
+                    sendPrompt(sock, priceMsg.str() + "\nConfirm (y/n): PROMPT@");
+                    confirm = receiveInput(sock);
+                    if (confirm == "y" || confirm == "n") break;
+                    sendMessage(sock, "❌ Invalid choice!\n");
+                }
+
+                if (confirm == "y") {
+                    time_t timestamp = time(nullptr);
+                    if (bookSeat(sock, currentTripId, seatChoice, aadhar, name)) {
+                        char timeBuf[80];
+                        strftime(timeBuf, sizeof(timeBuf), "%c", localtime(&timestamp));
+                        
+                        vector<string> booking = {
+                            currentTripId, busNo, seatChoice, 
+                            aadhar, name, to_string(finalPrice), timeBuf
+                        };
+                        writeFile(BOOKING_FILE, booking);
+                        
+                        sendMessage(sock, "✅ Seat is being Booked Successfully! " + string(timeBuf) + "\n");
+                        
+                        // Post-booking action
+                        string another;
+                        while (true) {
+                            sendPrompt(sock, "Book another seat? (y/n): PROMPT@");
+                            another = receiveInput(sock);
+                            if (another == "y" || another == "n") break;
+                            sendMessage(sock, "❌ Invalid input!\n");
+                        }
+
+                        if (another == "n") {
+                            returnToTrips = true;
+                            sendMessage(sock, "Returning to trip selection...\n");
+                        }
+                    }
                 }
             }
-
-            if (!seatFound)
-            {
-                sendPrompt(sock, "❌ Invalid/occupied seat. Try again.\n");
+            catch (const invalid_argument&) {
+                sendMessage(sock, "❌ Input cannot be blank!\n");
             }
         }
     }
 }
 
-// --- CLIENT HANDLER ---
 
-//----------DRIVER CLIENT--------------
+
+ 
+//DRIVER CLIENT--------------
 void driver_client(int sock)
 {
 
     Driver driver;
     while (true)
     {
-        sendPrompt(sock, "\n---------- MAIN MENU ----------\n1. Register\n2. Login\n3. Exit\nChoose: ");
+        sendPrompt(sock, "\n---------- MAIN MENU ----------\n1. Register\n2. Login\n3. Exit\nChoose: PROMPT@");
         string choice = receiveInput(sock);
 
         if (choice == "3")
@@ -1311,7 +1508,7 @@ void driver_client(int sock)
         if (choice == "1")
         {
             driver.registerDriver(sock);
-            sendPrompt(sock, "Please login to continue...\n");
+            sendMessage(sock, "Please login to continue...\n");
         }
 
         string uid = driver.loginDriver(sock);
@@ -1321,7 +1518,7 @@ void driver_client(int sock)
         bus_trip_handler handlerbus(uid);
         while (true)
         {
-            sendPrompt(sock, "\n---------- DASHBOARD ----------\n1. Register a bus \n2. Insert a trip\n3. Logout\nChoose: ");
+            sendPrompt(sock, "\n---------- DASHBOARD ----------\n1. Register a bus \n2. Insert a trip\n3. Logout\nChoose: PROMPT@");
             string action = receiveInput(sock);
             if (action == "1")
                 handlerbus.registerBus(sock);
@@ -1337,15 +1534,15 @@ void driver_client(int sock)
 //----------USER CLIENT----------------
 void handle_client(int sock)
 {
-    sendPrompt(sock, "🚍 Welcome to the Bus Reservation System 🚍\n");
-    sendPrompt(sock, "\n--------------Mention Your Requirements:---------------\n1(& default).USER\n2.DRIVER\n Enter Your Choice:");
+    sendMessage(sock, "🚍 Welcome to the Bus Reservation System 🚍\n");
+    sendPrompt(sock, "\n--------------Mention Your Requirements:---------------\n1(& default).USER\n2.DRIVER\n Enter Your Choice:PROMPT@");
     string c = receiveInput(sock);
     if (c == "2")
         driver_client(sock);
     User user;
     while (true)
     {
-        sendPrompt(sock, "\n---------- MAIN MENU ----------\n1. Register\n2. Login\n3. Exit\nChoose: ");
+        sendPrompt(sock, "\n---------- MAIN MENU ----------\n1. Register\n2. Login\n3. Exit\nChoose: PROMPT@");
         string choice = receiveInput(sock);
 
         if (choice == "3")
@@ -1354,7 +1551,7 @@ void handle_client(int sock)
         if (choice == "1")
         {
             user.registerUser(sock);
-            sendPrompt(sock, "Please login to continue...\n");
+            sendMessage(sock, "Please login to continue...\n");
         }
 
         string uid = user.login(sock);
@@ -1364,7 +1561,7 @@ void handle_client(int sock)
         ReservationHandler handler(uid);
         while (true)
         {
-            sendPrompt(sock, "\n---------- DASHBOARD ----------\n1. View Ticket\n2. Reserve Ticket\n3. Logout\nChoose: ");
+            sendPrompt(sock, "\n---------- DASHBOARD ----------\n1. View Ticket\n2. Reserve Ticket\n3. Logout\nChoose: PROMPT@");
             string action = receiveInput(sock);
             if (action == "1")
                 handler.viewTickets(sock);
@@ -1374,7 +1571,7 @@ void handle_client(int sock)
                 break;
             else
             {
-                sendPrompt(sock, "Oops! you mistyped. Try again");
+                sendMessage(sock, "Oops! you mistyped. Try again");
                 continue;
             }
         }
@@ -1403,7 +1600,7 @@ void broadcastServerIP()
         sendto(udp_socket, message.c_str(), message.length(), 0,
                (sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
         cout << "[Broadcasting] " << message << "\n";
-        sleep(2);
+        sleep(10);
     }
 }
 
@@ -1420,6 +1617,10 @@ int main()
     int addrlen = sizeof(address);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // Add these socket options
+int flag = 1;
+setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+setsockopt(server_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(TCP_PORT);
@@ -1433,6 +1634,10 @@ int main()
     while (true)
     {
         new_sock = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+         // Set socket options for the client connection
+    int flag = 1;
+    setsockopt(new_sock, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
         thread(handle_client, new_sock).detach();
     }
 
