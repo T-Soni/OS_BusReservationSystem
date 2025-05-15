@@ -21,7 +21,6 @@ This repository contains the Bus Reservation System Management project developed
     - [Reservation_Handler](#reservation-handler)
     - [bus_trip_handler](#bus_trip_handler)
   - [Utility Functions](#utility-functions)
-  - [How to Use](#how-to-use)
   - [Team Members](#team-members)
 
 
@@ -84,11 +83,28 @@ To get started with the development or usage of this project, follow the instruc
     cd bus-reservation-system-cpp
     ```
 
+3. lcrypto installation: Need to install before running the server. Use the comand line provided for installation.
+
+     ```bash
+    sudo apt install libssl-dev
+    ```
+
+
 ### Compilation
 
 To compile the project, you can use the following command in the terminal:
 
+1. For Server 
 
+    ```bash
+    g++ newserver.cpp -o s -lcrypto
+    ```
+
+1. For Client 
+
+    ```bash
+    g++ cmine.cpp -o c
+    ```
 
 
 
@@ -96,14 +112,26 @@ To compile the project, you can use the following command in the terminal:
 
 After successfully compiling the project, you can run the application using the command:
 
+1. For Server 
+
+    ```bash
+    ./s
+    ```
+
+1. For Client 
+
+    ```bash
+    ./c
+    ```
+
 
 
 ## File Structure
 
 The project directory typically contains the following files:
 
-- `cmine.cpp`: The main entry point of the application.
-- `newserver.cpp`: The server client implementation code.
+- `cmine.cpp`: The main entry point of the application including server client implementation.
+- `newserver.cpp`: Contains all methods and classes used in the project.
 - `users.txt`: The details of the users stored here after successful registration.
 - `drivers.txt`: A file containing all the details regarding successfully registered drivers.
 - `buses.txt`: Information regarding buses present. 
@@ -141,14 +169,6 @@ The project directory typically contains the following files:
 - Communication: `sendPrompt()`, `receiveInput()`
 - Validation: `isValidAadhar()`, `isAadharExist()`, `isValidLicense()`, `isLicenseExist()`
 
-## How to Use
-
-1. **Add a Bus**: Select the option to add a bus and enter the required details.
-2. **View Buses**: Select the option to view all available buses.
-3. **Remove a Bus**: Select the option to remove a bus and provide the bus ID.
-4. **Book a Ticket**: Select the option to book a ticket and enter the required details.
-5. **View Reservations**: Select the option to view all reservations.
-6. **Cancel a Reservation**: Select the option to cancel a reservation and provide the reservation ID.
 
 ## 👥 Team Members
 
